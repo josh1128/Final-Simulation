@@ -1,237 +1,261 @@
-# app.py (or Simulation.py)
-# HOPE Rwanda – Stormwater Solutions Sandbox (no Matplotlib)
+# permeable_pavement_app.py
+# Streamlit: Permeable Pavement Visualizer & Stormwater Simulator
+# - Choose porous asphalt, pervious concrete, or PICP
+# - Adjust storm depth/duration, area, slope, clogging, soil Ksat, layer thickness/voids
+# - Toggle underdrain and size its capacity
+# - Live water balance KPIs + bar chart
+# - Cross-section drawing of layers that updates with inputs
 
+import math
 import numpy as np
-import pandas as pd
+import matplotlib.pyplot as plt
 import streamlit as st
 
-st.set_page_config(page_title="HOPE Rwanda Stormwater Sandbox", layout="wide")
-st.title("HOPE Rwanda – Stormwater Solutions Sandbox")
+# -------------------- Page setup --------------------
+st.set_page_config(page_title="Permeable Pavements – Visualize & Simulate", layout="wide")
+st.title("🧱 Permeable Pavements – Visualize & Simulate")
 
-with st.expander("About this tool", expanded=False):
+st.caption(
+    "Interactive demo for HOPE Rwanda: explore how porous asphalt, pervious concrete, "
+    "or permeable interlocking concrete pavers (PICP) handle rainfall by storing, infiltrating, "
+    "and draining water through layered stone reservoirs to the soil below."
+)
+
+# -------------------- Defaults by pavement type --------------------
+PAVEMENT_PRESETS = {
+    "Porous asphalt": {
+        "surface_perm_mm_hr": 3_000,  # idealized clean surface permeability
+        "surface_thick_cm": 5,
+        "notes": "Porous asphalt relies on voids in the asphalt mix; avoid over-compaction."
+    },
+    "Pervious concrete": {
+        "surface_perm_mm_hr": 2_000,
+        "surface_thick_cm": 12,
+        "notes": "Place/finish quickly; do not over-trowel the surface."
+    },
+    "Permeable interlocking concrete pavers (PICP)": {
+        "surface_perm_mm_hr": 1_200,
+        "surface_thick_cm": 8,
+        "notes": "Infiltration occurs through joint stone between pavers; keep joints clean."
+    },
+}
+
+# -------------------- Sidebar controls --------------------
+st.sidebar.header("Storm & Site")
+
+P = st.sidebar.slider("Storm depth (mm)", min_value=5, max_value=1400, value=80, step=5)
+T = st.sidebar.slider("Storm duration (hours)", min_value=0.25, max_value=48.0, value=6.0, step=0.25)
+A = st.sidebar.number_input("Contributing area (m²)", min_value=10.0, value=400.0, step=10.0)
+slope = st.sidebar.slider("Surface slope (%)", 0.0, 12.0, 2.0, 0.5)
+
+st.sidebar.header("Pavement Type & Surface")
+ptype = st.sidebar.selectbox("Pavement type", list(PAVEMENT_PRESETS.keys()))
+preset = PAVEMENT_PRESETS[ptype]
+
+# Allow overrides
+surface_perm = st.sidebar.number_input(
+    "Clean surface permeability (mm/hr)",
+    min_value=100.0, value=float(preset["surface_perm_mm_hr"]), step=100.0
+)
+clog = st.sidebar.slider("Clogging level (0% = clean, 80% = very clogged)", 0, 80, 10, 5)
+surface_thick_cm = st.sidebar.number_input(
+    "Surface thickness (cm)", min_value=3.0, value=float(preset["surface_thick_cm"]), step=1.0
+)
+
+st.sidebar.header("Reservoir Layers")
+choker_thick_cm = st.sidebar.slider("Choker/bedding layer thickness (cm)", 2, 5, 3)
+base_thick_cm   = st.sidebar.slider("Base reservoir thickness (cm)", 5, 25, 10)
+subbase_thick_cm= st.sidebar.slider("Subbase reservoir thickness (cm)", 10, 60, 25)
+base_void = st.sidebar.slider("Base void ratio (0–0.5)", 0.10, 0.50, 0.30, 0.01)
+sub_void  = st.sidebar.slider("Subbase void ratio (0–0.5)", 0.10, 0.50, 0.35, 0.01)
+
+st.sidebar.header("Soils & Underdrain")
+soil_ksat = st.sidebar.number_input("Soil saturated hydraulic conductivity (mm/hr)", min_value=0.5, value=10.0, step=0.5)
+underdrain_on = st.sidebar.checkbox("Include underdrain", value=False)
+if underdrain_on:
+    drain_capacity_lps = st.sidebar.number_input("Underdrain capacity (L/s)", min_value=0.5, value=2.0, step=0.5)
+else:
+    drain_capacity_lps = 0.0
+
+st.sidebar.header("Conservatism & Extras")
+edge_losses = st.sidebar.slider("Edge/maintenance/construction losses (%)", 0, 20, 5, 1)
+safety_factor = st.sidebar.slider("Storage safety factor (0.8–1.2)", 0.8, 1.2, 1.0, 0.05)
+
+# -------------------- Helper calculations --------------------
+def mm_to_m(mm): return mm / 1000.0
+def cm_to_m(cm): return cm / 100.0
+def m3_to_L(m3): return m3 * 1000.0
+def L_to_m3(L): return L / 1000.0
+
+# Effective surface conductivity reduced by clogging:
+# Simple model: k_eff = k_clean * (1 - clog%)
+k_eff = surface_perm * (1.0 - clog / 100.0)  # mm/hr
+
+# Storm volumes
+rain_depth_m = mm_to_m(P)    # m
+rain_vol_m3  = rain_depth_m * A  # m³ total on contributing area
+
+# Losses (e.g., construction tracking fines, imperfect connectivity)
+rain_vol_m3_eff = rain_vol_m3 * (1.0 - edge_losses / 100.0)
+
+# Infiltration capacity through surface during the event (m³):
+surface_cap_mm = k_eff * T  # mm over the event
+surface_cap_m  = mm_to_m(surface_cap_mm)  # m water column
+surface_cap_m3 = surface_cap_m * A        # m³
+
+# Reservoir storage capacity (m³):
+base_storage_m3    = A * cm_to_m(base_thick_cm) * base_void
+subbase_storage_m3 = A * cm_to_m(subbase_thick_cm) * sub_void
+storage_m3 = safety_factor * (base_storage_m3 + subbase_storage_m3)
+
+# Soil exfiltration during event (m³):
+soil_exfil_mm = soil_ksat * T  # mm event
+soil_exfil_m3 = mm_to_m(soil_exfil_mm) * A
+
+# Underdrain discharge during event (m³):
+drain_m3 = 0.0
+if underdrain_on and drain_capacity_lps > 0:
+    drain_m3 = L_to_m3(drain_capacity_lps * 3600.0 * T)
+
+# -------------------- Water balance logic --------------------
+# 1) Rain hits surface; limited by surface infiltration capacity during event.
+infil_through_surface_m3 = min(rain_vol_m3_eff, surface_cap_m3)
+
+# 2) What reaches reservoir: (infiltrated water)
+to_reservoir_m3 = infiltr_through_surface_m3
+
+# 3) From reservoir, water can:
+#    - be stored up to storage_m3
+#    - exfiltrate to soil during event up to soil_exfil_m3
+#    - leave via underdrain up to drain_m3
+#    Any excess above (storage + exfil + drain) during the event overflows.
+capacity_during_event_m3 = storage_m3 + soil_exfil_m3 + drain_m3
+overflow_m3 = max(0.0, to_reservoir_m3 - capacity_during_event_m3)
+
+# 4) End-of-storm stored volume (cannot be negative):
+stored_end_m3 = min(storage_m3, max(0.0, to_reservoir_m3 - (soil_exfil_m3 + drain_m3)))
+
+# 5) “Runoff” here = water that could not pass surface during the event + overflow from reservoir
+surface_rejected_m3 = max(0.0, rain_vol_m3_eff - surface_cap_m3)
+runoff_m3 = surface_rejected_m3 + overflow_m3
+
+# 6) Accountability check (small rounding differences possible)
+balance_err = rain_vol_m3_eff - (runoff_m3 + soil_exfil_m3 + drain_m3 + stored_end_m3)
+if abs(balance_err) > 1e-6:
+    # Nudge stored volume to balance
+    stored_end_m3 = max(0.0, stored_end_m3 + balance_err)
+
+# -------------------- UI Layout --------------------
+left, right = st.columns([1.1, 0.9])
+
+# ---------- Left: Cross-section + notes ----------
+with left:
+    st.subheader("Cross-section (not to scale)")
+    fig, ax = plt.subplots(figsize=(6.2, 5.2))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    # Layer heights (normalized to figure)
+    # We'll map cm directly to relative heights for an intuitive visual
+    surf_h   = surface_thick_cm
+    chok_h   = choker_thick_cm
+    base_h   = base_thick_cm
+    sub_h    = subbase_thick_cm
+    total_h  = surf_h + chok_h + base_h + sub_h
+    # Normalize:
+    def nh(x): return x / total_h
+
+    y0 = 0.0
+    layers = [
+        ("Subbase reservoir", sub_h, (0.85, 0.92, 1.00), f"Void≈{sub_void:.2f}"),
+        ("Base reservoir",   base_h, (0.80, 0.87, 0.98), f"Void≈{base_void:.2f}"),
+        ("Choker/Bedding",   chok_h, (0.92, 0.92, 0.92), "Uniform stone"),
+        (ptype,              surf_h, (0.75, 0.75, 0.75), f"k≈{k_eff:.0f} mm/hr (eff.)"),
+    ]
+
+    for name, h_cm, color, note in layers:
+        h = nh(h_cm)
+        rect = plt.Rectangle((0.1, y0), 0.8, h, facecolor=color, edgecolor="black")
+        ax.add_patch(rect)
+        ax.text(0.5, y0 + h/2, f"{name}\n{h_cm:.0f} cm\n{note}",
+                ha="center", va="center", fontsize=9)
+        y0 += h
+
+    # Underdrain icon (if any)
+    if underdrain_on:
+        ax.plot([0.15, 0.85], [0.05, 0.05], lw=6)
+        ax.text(0.5, 0.02, f"Underdrain (~{drain_capacity_lps:.1f} L/s capacity)", ha="center", va="bottom", fontsize=9)
+
+    # Soil label
+    ax.text(0.5, -0.02, f"Soil (Ksat≈{soil_ksat:.1f} mm/hr)", ha="center", va="top", fontsize=10)
+
+    st.pyplot(fig)
+
+    with st.expander("Construction & O&M tips (summary)"):
+        st.markdown(
+            f"""
+- **Keep fines out** during construction; protect layers from mud contamination to prevent clogging.  
+- **{ptype}**: {preset['notes']}  
+- **Subgrade**: Avoid over-compaction; enable infiltration to native soils.  
+- **Maintenance**: Routine sweeping/vacuuming of surface (esp. joints for PICP) to reduce clogging; keep gutters/edges clean.  
+- **Steeper sites**: Consider terraced subgrades and/or underdrains to control internal flow down slope.
+"""
+        )
+
+# ---------- Right: KPIs + bar chart ----------
+with right:
+    st.subheader("Event Water Balance (end of storm)")
+
+    kpi1, kpi2, kpi3 = st.columns(3)
+    kpi1.metric("Rain volume", f"{rain_vol_m3_eff:,.1f} m³")
+    kpi2.metric("Runoff/Overflow", f"{runoff_m3:,.1f} m³")
+    kpi3.metric("Stored in reservoir", f"{stored_end_m3:,.1f} m³")
+
+    kpi4, kpi5, kpi6 = st.columns(3)
+    kpi4.metric("Exfiltrated to soil", f"{soil_exfil_m3:,.1f} m³")
+    kpi5.metric("Underdrain outflow", f"{drain_m3:,.1f} m³")
+    kpi6.metric("Surface k (eff.)", f"{k_eff:,.0f} mm/hr")
+
+    st.markdown("---")
+
+    # Bar chart
+    labels = ["Runoff", "Stored", "Soil Exfiltration", "Underdrain"]
+    values = [runoff_m3, stored_end_m3, soil_exfil_m3, drain_m3]
+
+    fig2, ax2 = plt.subplots(figsize=(6.6, 3.5))
+    ax2.bar(labels, values)
+    ax2.set_ylabel("Volume (m³)")
+    ax2.set_title("Where did the stormwater go?")
+    for idx, v in enumerate(values):
+        ax2.text(idx, v + max(values)*0.02 if max(values) > 0 else 0.02, f"{v:.1f}", ha="center", va="bottom", fontsize=9)
+    st.pyplot(fig2)
+
+# -------------------- Explanations --------------------
+with st.expander("How this simulation works"):
     st.markdown(
         """
-Explore combined effects of feasible measures at the HOPE Rwanda site:
-- Rainwater Harvesting (barrels/tanks)
-- Vetiver Grass hedgerows
-- Hügelkultur beds
-- Permeable Pavements
-
-This uses a simplified SCS–Curve Number water balance to show estimated runoff reduction,
-temporary storage, and a qualitative Road Protection Score (illustrative).
+**Surface infiltration** is limited by the pavement's effective permeability over the storm duration.  
+That water enters the **stone reservoirs** (base + subbase), which have storage based on thickness × area × void ratio.  
+During the storm, water can **exfiltrate to soil** (limited by soil Ksat) and, if present, **drain out** via an underdrain (limited by its capacity).  
+If incoming water exceeds the sum of **surface capacity + soil exfiltration + drain + storage**, the excess appears as **runoff/overflow**.
 """
     )
 
-# -------------------------
-# Sidebar: Site & Storm Inputs
-# -------------------------
-st.sidebar.header("1) Site & Storm Inputs")
-
-colA, colB = st.sidebar.columns(2)
-P_mm = colA.slider("Design storm depth P (mm)", 20, 200, 80, 5)
-catchment_area_m2 = colB.number_input("Road catchment draining to problem spots (m²)", 100.0, 20000.0, 3000.0, 50.0)
-
-colC, colD = st.sidebar.columns(2)
-roof_area_m2 = colC.number_input("Rooftop area available for harvesting (m²)", 0.0, 5000.0, 400.0, 10.0)
-base_CN = colD.slider("Base Curve Number (dirt roads/soils)", 70, 95, 85, 1)
-
-slope_note = st.sidebar.selectbox("Slope condition", ["Low", "Moderate", "Steep"], index=1)
-slope_factor = {"Low": 0.95, "Moderate": 1.00, "Steep": 1.05}[slope_note]
-
-# -------------------------
-# Sidebar: Solutions
-# -------------------------
-st.sidebar.header("2) Solutions")
-
-# Rainwater Harvesting
-harv_on = st.sidebar.toggle("Enable Rainwater Harvesting", value=True)
-if harv_on:
-    colH1, colH2 = st.sidebar.columns(2)
-    storage_per_unit_L = colH1.number_input("Unit size (L)", 200.0, 10000.0, 1000.0, 50.0)
-    n_units = colH2.number_input("# of units", 0, 500, 10, 1)
-    first_flush_mm = st.sidebar.slider("First-flush diverter (mm skimmed)", 0, 5, 2, 1)
-else:
-    storage_per_unit_L, n_units, first_flush_mm = 0.0, 0, 0
-
-# Vetiver Grass
-vetiver_on = st.sidebar.toggle("Enable Vetiver Grass hedgerows", value=True)
-if vetiver_on:
-    vetiver_CN_delta = st.sidebar.slider("CN reduction from vetiver (points)", 0, 10, 4, 1)
-    vetiver_infiltration_boost = st.sidebar.slider("Extra infiltration from vetiver (%)", 0, 30, 10, 1) / 100.0
-else:
-    vetiver_CN_delta, vetiver_infiltration_boost = 0, 0.0
-
-# Hügelkultur
-hug_on = st.sidebar.toggle("Enable Hügelkultur beds", value=True)
-if hug_on:
-    colHu1, colHu2, colHu3 = st.sidebar.columns(3)
-    n_beds = colHu1.number_input("# of beds", 0, 200, 20, 1)
-    bed_length_m = colHu2.number_input("Bed length (m)", 1.0, 50.0, 6.0, 0.5)
-    bed_width_m = colHu3.number_input("Bed width (m)", 0.5, 5.0, 1.2, 0.1)
-    bed_core_depth_m = st.sidebar.number_input("Core thickness (m)", 0.1, 2.0, 0.6, 0.05)
-    core_porosity = st.sidebar.slider("Core porosity (void fraction)", 0.20, 0.80, 0.50, 0.05)
-    border_loss_factor = st.sidebar.slider("Edge losses (fraction of capacity)", 0.0, 0.5, 0.15, 0.05)
-    hug_intercept_share = st.sidebar.slider("Share of road runoff intercepted by beds (%)", 0, 80, 30, 5) / 100.0
-else:
-    n_beds, bed_length_m, bed_width_m, bed_core_depth_m = 0, 0.0, 0.0, 0.0
-    core_porosity, border_loss_factor, hug_intercept_share = 0.0, 0.0, 0.0
-
-# Permeable Pavements
-pp_on = st.sidebar.toggle("Enable Permeable Pavements", value=False)
-if pp_on:
-    pp_CN_delta = st.sidebar.slider("CN reduction (permeable area)", 0, 20, 8, 1)
-    pp_infiltration_share = st.sidebar.slider("Direct infiltration on permeable area (%)", 0, 90, 40, 5) / 100.0
-    pp_fraction_of_catch = st.sidebar.slider("Fraction of catchment converted", 0.0, 1.0, 0.25, 0.05)
-else:
-    pp_CN_delta, pp_infiltration_share, pp_fraction_of_catch = 0, 0.0, 0.0
-
-# -------------------------
-# Helpers
-# -------------------------
-def scs_runoff_depth_mm(P, CN):
-    """SCS-CN runoff depth (mm)."""
-    S = 25400.0 / CN - 254.0  # mm
-    Ia = 0.2 * S
-    if P <= Ia:
-        return 0.0
-    return ((P - Ia) ** 2) / (P + 0.8 * S)
-
-def m3_from_mm_over_area(mm, area_m2):
-    return (mm / 1000.0) * area_m2
-
-# -------------------------
-# 1) Baseline runoff (with solution-adjusted CN)
-# -------------------------
-CN_effective = base_CN
-if vetiver_on:
-    CN_effective = max(30, CN_effective - vetiver_CN_delta)
-if pp_on:
-    # Weighted CN with permeable patch reduction
-    CN_effective = (1 - pp_fraction_of_catch) * CN_effective + pp_fraction_of_catch * max(30, CN_effective - pp_CN_delta)
-
-CN_effective = CN_effective * slope_factor
-Q_mm = scs_runoff_depth_mm(P_mm, CN_effective)
-baseline_runoff_m3 = m3_from_mm_over_area(Q_mm, catchment_area_m2)
-
-# -------------------------
-# 2) Rainwater Harvesting
-# -------------------------
-if harv_on:
-    harvest_P_effective_mm = max(0.0, P_mm - first_flush_mm)
-    roof_yield_m3 = m3_from_mm_over_area(harvest_P_effective_mm, roof_area_m2)
-    total_rooftop_storage_m3 = (storage_per_unit_L * n_units) / 1000.0
-    captured_roof_m3 = min(roof_yield_m3, total_rooftop_storage_m3)
-    roof_overflow_m3 = max(0.0, roof_yield_m3 - captured_roof_m3)
-else:
-    roof_yield_m3 = 0.0
-    captured_roof_m3 = 0.0
-    roof_overflow_m3 = 0.0
-
-# -------------------------
-# 3) Hügelkultur storage & interception
-# -------------------------
-if hug_on:
-    hugel_core_vol_m3 = n_beds * bed_length_m * bed_width_m * bed_core_depth_m
-    hugel_storage_m3 = hugel_core_vol_m3 * core_porosity * (1.0 - border_loss_factor)
-    hugel_intercepted_m3 = min(baseline_runoff_m3 * hug_intercept_share, hugel_storage_m3)
-    hugel_overflow_m3 = max(0.0, baseline_runoff_m3 * hug_intercept_share - hugel_intercepted_m3)
-else:
-    hugel_storage_m3 = 0.0
-    hugel_intercepted_m3 = 0.0
-    hugel_overflow_m3 = 0.0
-
-# -------------------------
-# 4) Permeable pavements direct infiltration (on permeable fraction)
-# -------------------------
-if pp_on:
-    pp_incident_rain_m3 = m3_from_mm_over_area(P_mm, catchment_area_m2 * pp_fraction_of_catch)
-    pp_direct_infiltration_m3 = pp_incident_rain_m3 * pp_infiltration_share
-else:
-    pp_direct_infiltration_m3 = 0.0
-
-# -------------------------
-# 5) Vetiver additional infiltration
-# -------------------------
-remaining_after_hugel = max(0.0, baseline_runoff_m3 - hugel_intercepted_m3)
-vetiver_extra_infiltration_m3 = remaining_after_hugel * vetiver_infiltration_boost if vetiver_on else 0.0
-
-# -------------------------
-# 6) Combine flows
-# -------------------------
-effective_runoff_m3 = (
-    max(0.0, baseline_runoff_m3 - hugel_intercepted_m3 - vetiver_extra_infiltration_m3)
-    + hugel_overflow_m3
-)
-effective_runoff_m3 = max(0.0, effective_runoff_m3 - pp_direct_infiltration_m3)
-effective_runoff_m3 += roof_overflow_m3
-
-# -------------------------
-# 7) Road Protection Score (0–100)
-# -------------------------
-reduction_ratio = 1.0 - (effective_runoff_m3 / (baseline_runoff_m3 + 1e-9))
-score = (
-    40 * max(0.0, reduction_ratio)
-    + 20 * (1.0 if vetiver_on else 0.0)
-    + 20 * (pp_fraction_of_catch if pp_on else 0.0)
-    + 20 * (min(1.0, hugel_intercepted_m3 / (hugel_storage_m3 + 1e-9)) if hug_on else 0.0)
-)
-score = float(np.clip(score, 0, 100))
-
-# -------------------------
-# Outputs
-# -------------------------
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Baseline runoff (m³)", f"{baseline_runoff_m3:,.1f}")
-col2.metric("Effective runoff after solutions (m³)", f"{effective_runoff_m3:,.1f}")
-col3.metric("Water captured in tanks (m³)", f"{captured_roof_m3:,.1f}")
-col4.metric("Road Protection Score (0–100)", f"{score:.0f}")
-
-st.divider()
-st.subheader("Water Balance & Effects Summary")
-
-summary_rows = [
-    ("Design storm depth (mm)", P_mm),
-    ("Catchment area (m²)", catchment_area_m2),
-    ("Effective CN (after solutions)", round(CN_effective, 1)),
-    ("Baseline runoff (m³)", round(baseline_runoff_m3, 2)),
-    ("Rooftop yield (m³)", round(roof_yield_m3, 2)),
-    ("Captured in tanks (m³)", round(captured_roof_m3, 2)),
-    ("Rooftop overflow (m³)", round(roof_overflow_m3, 2)),
-    ("Hügel storage capacity (m³)", round(hugel_storage_m3, 2)),
-    ("Hügel intercepted (m³)", round(hugel_intercepted_m3, 2)),
-    ("Hügel overflow (m³)", round(hugel_overflow_m3, 2)),
-    ("Permeable direct infiltration (m³)", round(pp_direct_infiltration_m3, 2)),
-    ("Vetiver extra infiltration (m³)", round(vetiver_extra_infiltration_m3, 2)),
-    ("Effective runoff after solutions (m³)", round(effective_runoff_m3, 2)),
-    ("Road Protection Score", round(score, 0)),
-]
-df = pd.DataFrame(summary_rows, columns=["Metric", "Value"])
-st.dataframe(df, use_container_width=True, hide_index=True)
-
-st.subheader("Distribution of Water (m³)")
-bars = pd.DataFrame(
-    {
-        "Volume (m³)": {
-            "Tanks (rooftop)": float(captured_roof_m3),
-            "Hügel intercepted": float(hugel_intercepted_m3),
-            "Permeable infiltration": float(pp_direct_infiltration_m3),
-            "Vetiver added infiltration": float(vetiver_extra_infiltration_m3),
-            "Remaining runoff": float(effective_runoff_m3),
-        }
-    }
-)
-# Streamlit’s built-in chart (no extra plotting packages required)
-st.bar_chart(bars)
-
-st.divider()
-st.markdown("### What to try")
-st.markdown(
-    """
-- Increase **# of tanks** or **unit size** to reduce ground overflow.
-- Add **Hügelkultur** (more/longer/deeper/higher porosity) to intercept more road runoff.
-- Turn on **Permeable Pavements** and grow the **converted fraction** to boost direct infiltration.
-- Increase **Vetiver CN reduction** and **extra infiltration** to represent dense, maintained hedgerows.
-- Test higher **storm depths** and compare the Road Protection Score.
+with st.expander("Which sliders to tweak for lower vs higher runoff?"):
+    st.markdown(
+        """
+- **To lower runoff**: decrease *clogging*, increase *storm duration* (same depth), increase *base/subbase thickness* or *void ratios*, increase *soil Ksat*, and/or enable a higher-capacity *underdrain*.  
+- **To increase runoff** (stress test): increase *clogging*, shorten *storm duration* (same depth), reduce *reservoir thickness/voids*, turn off or shrink the *underdrain*, and/or lower *soil Ksat*.
 """
-)
+    )
+
+with st.expander("Notes on suitability for HOPE Rwanda’s narrow access roads"):
+    st.markdown(
+        """
+Permeable pavements are best in **low-speed, low-traffic** areas like small access roads and parking pads.  
+They combine **drivable surface + stormwater management** in a compact footprint—useful where right-of-way is tight or slopes are present.  
+For steeper hills, use **terraced subgrades** and consider **underdrains** to manage internal flow downslope.
+"""
+    )
 
